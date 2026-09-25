@@ -1,0 +1,25 @@
+# ESP32C2_tank build defaults.
+# After changing this, delete sdkconfig.esp32-c2-devkitm-1 and rebuild
+# (or run: pio run -t fullclean), otherwise changes won't take effect.
+
+CONFIG_IDF_TARGET="esp32c2"
+
+# The reference project for_example/tank/c2_tracked_chassis also has this line.
+# Comment there says "Bypass a bug. Use 26M XTAL Freq" -- that chassis's C2
+# module uses a 26MHz crystal instead of the default 40MHz.
+# Keep this if your board matches; if you see crystal errors on serial or
+# WiFi won't start, check this first.
+
+CONFIG_XTAL_FREQ_26=y
+
+# Default single-app partition on 4MB flash only gives 1MB; WiFi + httpd
+# might hit the limit. This gives 1.5MB app partition. No OTA needed,
+# so no dual partition required.
+
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# Log over UART0, same port as flash/monitor
+CONFIG_ESP_CONSOLE_UART_NUM=0
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y
