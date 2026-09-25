@@ -13,6 +13,7 @@ idf_component_register(
         "main.c"
         "motion.c"
         "link.c"
+        "udp.c"
         "wifi_prov.c"
         "web.c"
     INCLUDE_DIRS

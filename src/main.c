@@ -24,6 +24,7 @@
 
 #include "link.h"
 #include "motion.h"
+#include "udp.h"
 #include "web.h"
 #include "wifi_prov.h"
 
@@ -60,6 +61,13 @@ void app_main(void)
     err = wifi_prov_start();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "WiFi 起不来：%s", esp_err_to_name(err));
+    }
+
+    /* 无线驱动：收 Ecam 的摇杆包。它和网页遥控用的是同一个 motion_drive()，
+     * 所以两边谁在开车都行，看门狗对两个来源一视同仁 */
+    err = udp_start();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "UDP 起不来：%s（Ecam 那条无线驱动就没了）", esp_err_to_name(err));
     }
 
     /* 网页：即使还没连上网也先起服务，等 IP 一到就能访问 */

@@ -1,8 +1,8 @@
 # ESP32C2 tank
 
-ESP32-C2 履带车模块的固件。这块板子挂在一辆双电机履带底盘上，通过 UART 听 Ecam
-的指挥：接收摇杆来的差速指令、把 WiFi 凭据收下来存进 NVS、连上之后起一个网页，
-手机浏览器打开它的 IP 就能开这辆车。
+ESP32-C2 履带车模块的固件。这块板子挂在一辆双电机履带底盘上，**插上两根线只为把
+WiFi 凭据交给它**，交完就可以拔掉——之后 Ecam 用 UDP 无线发摇杆数据开车，车自己
+起一个网页，手机浏览器打开它的 IP 也能开（两条驱动路径）。
 
 它是 `E_cam/` 工作目录里的四个平行仓库之一（2026-09-23 分的家，各自独立）：
 
@@ -14,27 +14,37 @@ ESP32-C2 履带车模块的固件。这块板子挂在一辆双电机履带底�
 | `for_example/` | 参考项目，只读不改 |
 
 ```
-Ecam（主机，摇杆 + 屏幕）          C2（本工程，车上）
-     UART1 TX ────────────────→ RX    运动指令 x<f> y<f>
-     UART1 RX ←──────────────── TX    身份 / IP / 凭据结果
+Ecam（主机，摇杆 + 屏幕）              C2（本工程，车上）
+  ① UART1（只在配网时插着）
+     TX ─────────────────────────→ RX    #hi / #wifi 1,2,3（凭据）
+     RX ←───────────────────────── TX    #ok / #wifi ok / #ip
+  ② UDP 单播 :3333（拔线之后，20Hz）
+     ─────────────────────────────→      运动指令 x<f> y<f>
+     ←─────────────────────────────      1Hz #ip 心跳
 ```
+
+**运动指令两条路都收，凭据只认有线那条**（UDP 上收到 `#wifi` 一律回
+`#wifi err 4`）——理由见下面"协议"一节。
 
 ## 目录
 
 | 文件 | 管什么 |
 | --- | --- |
-| `src/main.c` | 启动顺序，四步串起来 |
+| `src/main.c` | 启动顺序，五步串起来 |
 | `src/motion.c` | 差速电机 + 500ms 看门狗 |
-| `src/link.c` | UART 行式解析、base64、凭据事务 |
+| `src/link.c` | 行式解析、base64、凭据事务。**UART 和 UDP 共用这一个解析器** |
+| `src/udp.c` | 无线驱动链路：收 20Hz 摇杆包、回 1Hz `#ip` 心跳 |
 | `src/wifi_prov.c` | NVS 存凭据、STA 连接、IP 回调 |
 | `src/web.c` | HTTP 遥控页面 |
 | `boards/` | `esp32-c2-devkitm-1` 的板定义，**项目自带一份**（理由见"构建"） |
 | `include/` `lib/` `test/` | PlatformIO 脚手架留下来的空目录，没用到 |
 
-启动顺序是 `motion → link → wifi → web`，**任何一步失败都不中止**：
+启动顺序是 `motion → link → wifi → udp → web`，**任何一步失败都不中止**：
 
 - 电机先停稳再听指令；
 - 链路早早开着（Ecam 一插上就会发 `#hi` 和运动指令）；
+- UDP 要在 WiFi 之后，但它建 socket 和收包都不依赖"已经连上"，
+  连不上就是收不到东西而已；
 - 网页最后起，它要等 IP，而 IP 归 WiFi 管。
 
 车上没有屏幕，"起不来"和"跑起来了但没连上网"必须能从日志里分清，所以这里不用
@@ -46,9 +56,17 @@ PlatformIO + ESP-IDF（`framework = espidf`，不是 Arduino）：
 
 ```bash
 pio run                  # 构建
-pio run -t upload        # 烧录（460800，板子上是 USB 转串口）
+pio run -t upload        # 烧录
 pio device monitor       # 串口，115200
 ```
+
+`platformio.ini` 里 `upload_speed = 115200`（原先写 460800，掉回默认值更稳），
+`monitor_speed = 115200`。
+
+⚠️ **构建目录在 OneDrive 里，会出怪事。** 中断过一次构建之后，下一次大概率报
+`FileExistsError [WinError 183]`，栈在 `os.makedirs('.pio/build/<board>')`——
+PlatformIO 先 `isdir()` 判断、再 `makedirs()`，而 OneDrive 会在这两步中间**异步**
+把目录建出来。删掉 `.pio/build` 重跑即可。
 
 ### `src/CMakeLists.txt` 是手写的
 
@@ -90,33 +108,52 @@ PlatformIO 生成的那份只有 `idf_component_register(SRCS ${app_sources})`�
   flash 上只给 1MB，WiFi + httpd 可能顶到上限；这个给 1.5MB。不打算做 OTA，
   所以不需要双分区。
 
-⚠️ `sdkconfig.defaults` 写的是 `CONFIG_ESPTOOLPY_FLASHSIZE_2MB=y`，而
-`boards/esp32-c2-devkitm-1.json` 里 `flash_size` 是 `4MB`。**两个数对不上**，
-以手上的模块为准查一遍——flash size 写大了会在烧录时报错，写小了则白白少用一半。
+### flash 大小：这块模组是 2MB，板定义里写的是 4MB
+
+**别信板定义里的 4MB。** 手上的 C2 模组是 2MB flash，而 `boards/` 里那份板定义
+（抄的是官方 devkit）写的是 4MB，两边对不上会同时踩两个坑：
+
+1. 每次构建都刷一条 `Flash memory size mismatch detected. Expected 4MB, found 2MB!`；
+2. **构建最后一步 `elf2image` 直接失败**：
+   `A fatal error occurred: Contents of segment at SHA256 digest offset 0xb0 are not all zero.`
+   （PlatformIO 给 RISC-V 芯片硬编码了 `--elf-sha256-offset 0xb0`，flash 大小对不上
+   时镜像布局变了，0xb0 就落不到那个空的 digest 字段上。）
+
+修法是在 `platformio.ini` 里覆盖两条板级属性：
+
+```ini
+board_upload.flash_size = 2MB   ; 生成镜像和上传时用
+board_build.flash_size  = 2MB   ; 让 IDF 那边的默认值也跟着对齐
+```
 
 改完 `sdkconfig.defaults` 要删掉 `sdkconfig.esp32-c2-devkitm-1` 再重建
 （或者 `pio run -t fullclean`），否则不生效。
 
-## 协议（UART1 ↔ Ecam 的 GPIO10/11）
+## 协议（UART1 配网 + UDP 驱动）
 
-**纯文本行，115200 8N1。** 两边必须一致，对端的说明在
+**纯文本行，同一套解析器跑在两个传输上**（`link_handle_line`）。UART 是
+115200 8N1；UDP 是本机 `:3333` 上收单播。两边必须一致，对端的说明在
 [Ecam 仓库 README](https://github.com/40chen/ESP32S3_Ecam) 的"外接模块 → 履带车"
-一节，和参考项目 `for_example/tank/c2_tracked_chassis` 一字兼容。
+一节，运动指令那一行和参考项目 `for_example/tank/c2_tracked_chassis` 一字兼容。
 
-| 方向 | 行 | 说明 |
+| 方向 | 行 | 走哪条 |
 | --- | --- | --- |
-| Ecam → C2 | `x<f> y<f>\n` | 差速：x 转向、y 前后，各 −1..1 |
-| Ecam → C2 | `#hi` | 问身份 |
-| C2 → Ecam | `#ok v1 tank` | 不答 = 旧固件，不推凭据 |
-| Ecam → C2 | `#wifi 1 <b64 SSID>` / `#wifi 2 <b64 PASS>` / `#wifi 3` | 事务式，**第三行才写 NVS** |
-| C2 → Ecam | `#wifi ok` / `#wifi err <code>` | 结果 |
-| C2 → Ecam | `#ip <addr>` | 拿到 IP / 掉线（传空地址） |
+| Ecam → C2 | `x<f> y<f>\n` | **两条都走**（没 IP 时 Ecam 走 UART） |
+| Ecam → C2 | `#hi` | UART |
+| C2 → Ecam | `#ok v1 tank` | UART，不答 = 旧固件 |
+| Ecam → C2 | `#wifi 1 <b64 SSID>` / `#wifi 2 <b64 PASS>` / `#wifi 3` | **只走 UART** |
+| C2 → Ecam | `#wifi ok` / `#wifi err <code>` | UART |
+| C2 → Ecam | `#ip <addr>` | UART 报一次，之后**每秒一条当 UDP 心跳** |
 
 **串口脚是 C2 自己的编号，和 Ecam 那边是两套：** 本侧 TX=GPIO10、RX=GPIO18
 （沿用参考项目）。Ecam 的 TX 接这里的 RX，Ecam 的 RX 接这里的 TX。
 
 几处刻意的设计：
 
+- **UDP 上不接受凭据**（`#wifi` 回 `#wifi err 4`）。这条不是防君子：运动指令
+  无所谓（网页遥控本来就无鉴权，用户已经接受了），但**凭据不能让局域网里任何人
+  写**——往 3333 端口打一行 `#wifi 1 ...` 就能改掉车连哪个网络，这个便宜不能给。
+  所以 `link_handle_line()` 带一个 `allow_provisioning`，只有 UART 那条路传 true。
 - **行式解析，攒到 `\n` 才解析。** 参考项目是每 20ms 读一次缓冲区直接 `sscanf`，
   凭据那种一百多字节的行一定会被切成两半。这里超过 160 字节的整行丢掉——
   **宁可丢一帧也不要拼半行**。
@@ -129,6 +166,8 @@ PlatformIO 生成的那份只有 `idf_component_register(SRCS ${app_sources})`�
   别以为它是安全的。
 - **`#wifi ok` 只表示"凭据收下了"，不表示"连上了"。** 连没连上走 `#ip`；
   连不上则没有回报。Ecam 那边判的是"凭据送达"，不是"网络通了"。
+- **UDP 明文，没有加密也没有认证。** 局域网里谁都可能往 3333 端口发包开车。
+  和网页遥控的定位一样：车在用户脚边、局域网内可以接受，**别接到公共网络上**。
 
 ## 运动（motion.c）
 
@@ -149,10 +188,12 @@ PlatformIO 生成的那份只有 `idf_component_register(SRCS ${app_sources})`�
 ### 看门狗归电机管，不归 UART
 
 最后一次收到驱动指令起 **500ms** 没再来就停车。参考项目把这段放在 UART 解析里，
-但那样只有 UART 一个来源——**现在有两条驱动路径**（Ecam 的摇杆、手机网页），
-只看 UART 会把手机遥控的车每 500ms 停一次。
+但那样只有 UART 一个来源——**现在有三条驱动路径**（Ecam 有线、Ecam 的 UDP
+摇杆、手机网页），只看 UART 会把另外两条开着的时候每 500ms 停一次。
 
 所以它归 `motion.c` 管：任何一条 `motion_drive()` 都把计时喂上，谁断了都停。
+（Ecam 那边 20Hz 发一条、居中时也照发，所以"松手"和"断链"对它是一回事：
+不发就是停，正好也是安全值。）
 
 两个细节：
 
@@ -206,8 +247,7 @@ C2 只有 272KB RAM、4MB flash，那套搬不过来也不划算。）
 - **`#wifi ok` 报早了。** 它表示"凭据已收下"，真正连上没有回报。想让它反映
   "连上了"得等 `WIFI_EVENT_STA_DISCONNECTED` 里的 `s_err` 有个回传通道，
   目前 `wifi_prov_last_error()` 写好了但**没人调用**。
-- **网页无认证**，见上。
-- **`sdkconfig.defaults` 的 2MB flash 和板定义的 4MB 对不上**，见"构建"一节。
+- **网页和 UDP 都无认证**，见上。
 - **`motion.c` 的引脚是照参考项目抄的**，没有在实物上核对过模块板的走线。
 - `include/` `lib/` `test/` 是 PlatformIO 脚手架留下的空目录，可以删。
 
@@ -215,3 +255,8 @@ C2 只有 272KB RAM、4MB flash，那套搬不过来也不划算。）
 
 运动控制移植自 `for_example/tank/c2_tracked_chassis`；协议和 `ESP32S3_Ecam`
 的"外接模块 → 履带车"一节是**一份契约的两半**，改一边必须改另一边。
+
+这个仓库是**车的那一半**，主机那一半（摇杆 UI、二维码、UDP 发包节拍）在
+[40chen/ESP32S3_Ecam](https://github.com/40chen/ESP32S3_Ecam)。两边一起改的时候
+最容易漏的是**行格式**和**端口号 3333**（本仓库 `src/udp.h` 的 `UDP_PORT`，
+对面 `main/app/app_tank.c` 的 `APP_TANK_UDP_PORT`）。

@@ -17,11 +17,11 @@
     "arduino",
     "espidf"
   ],
-  "name": "Espressif ESP32-C2-DevKitM-1",
+  "name": "Espressif ESP32-C2-DevKitM-1 (2MB module)",
   "upload": {
-    "flash_size": "4MB",
+    "flash_size": "2MB",
     "maximum_ram_size": 278528,
-    "maximum_size": 4194304,
+    "maximum_size": 2097152,
     "require_upload_port": true,
     "speed": 460800
   },

@@ -126,14 +126,14 @@ void link_send_ip(const char *ip)
 /*---------------------------------------------------------------------------
  * 命令
  *-------------------------------------------------------------------------*/
-static void handle_line(char *line)
+void link_handle_line(char *line, bool allow_provisioning)
 {
     /* ---- 运动指令：x<f> y<f> ---- */
     if (line[0] == 'x') {
         float x = 0.0f, y = 0.0f;
         if (sscanf(line, "x%f y%f", &x, &y) == 2) {
-            motion_drive(x, y);
-            return;                 /* 收到运动指令 → 看门狗重新计时（在任务里） */
+            motion_drive(x, y);     /* 喂看门狗在 motion_drive 里，两条路共用 */
+            return;
         }
         ESP_LOGW(TAG, "运动指令格式不对: %s", line);
         return;
@@ -152,6 +152,13 @@ static void handle_line(char *line)
 
     /* ---- 凭据事务 ---- */
     if (strncmp(line, "#wifi ", 6) == 0) {
+        if (!allow_provisioning) {
+            /* 从无线来的凭据一律不认。见 link.h 里的说明：这条不是防君子，
+             * 是"局域网里任何人打一行就能改掉车的配网"确实太好用了 */
+            ESP_LOGW(TAG, "拒绝来自无线的凭据写入: %s", line);
+            reply("#wifi err 4\n");
+            return;
+        }
         const char *body = line + 6;
         if (body[0] == '1' && body[1] == ' ') {
             if (b64_decode(body + 2, s_cred_ssid, sizeof(s_cred_ssid)) < 0) {
@@ -215,7 +222,8 @@ static void link_task(void *arg)
             if (c == '\n') {
                 if (!over && len > 0) {
                     line[len] = '\0';
-                    handle_line(line);
+                    /* 有线这条路才能推凭据（见 link_handle_line 的说明） */
+                    link_handle_line(line, true);
                 }
                 len = 0;
                 over = false;
